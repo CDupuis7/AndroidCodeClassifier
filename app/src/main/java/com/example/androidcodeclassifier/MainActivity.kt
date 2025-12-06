@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+
+//import android.os.ThermalManager
 import android.widget.Toast
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -29,11 +31,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.abs
 import kotlin.math.round
 import kotlin.math.roundToInt
-import kotlin.math.roundToLong
 import kotlin.system.measureNanoTime
-
 
 class MainActivity : ComponentActivity() {
     //Private Variables
@@ -56,6 +57,14 @@ class MainActivity : ComponentActivity() {
     private var peakHeapText by mutableStateOf("--")
     private var avgPssText by mutableStateOf("--")
     private var peakPssText by mutableStateOf("--")
+
+    // Battery current + CPU temp display strings
+    private var avgCurrentText by mutableStateOf("--")
+    private var avgCpuTempText by mutableStateOf("--")
+
+    // NEW: approximate energy per inference
+    private var energyPerInfText by mutableStateOf("--")
+
     private var runsText by mutableStateOf("500")
     private val dOptions = listOf(512, 1024, 2048)
     private var selectedDim by mutableStateOf(2048)
@@ -91,10 +100,13 @@ class MainActivity : ComponentActivity() {
                 bestSimText = "--"; class1SimText = "--"; class2SimText = "--"
                 avgMsText = "--"; totalMsText = "--"; batteryText = "--"; peakHeapText = "--"
                 avgPssText = "--"; peakPssText = "--"
+                avgCurrentText = "--"; avgCpuTempText = "--"
+                energyPerInfText = "--"
                 predictedEmoji = ""; predictedClassName = ""
             }
 
             val batteryStart = getBatteryPercent()
+            val batteryVoltageMv = getBatteryVoltageMillivolts() // for energy calc
 
             //Dump/gather opcodes from APK Dex files
             val outFile = ApkDexAnalyzer.dumpFirstOpcodesToFile(
@@ -155,6 +167,12 @@ class MainActivity : ComponentActivity() {
             var peakPssMb = 0.0
             var sumPssMb = 0.0
 
+            // Accumulators for current & CPU temp
+            var sumCurrentMa = 0.0
+            var currentSamples = 0
+            var sumCpuTempC = 0.0
+            var cpuTempSamples = 0
+
             val encoder = OpcodeMethodEncoder(
                 D = selectedDim,
                 posFraction = 0.5,
@@ -176,6 +194,7 @@ class MainActivity : ComponentActivity() {
                     bestS1 = s1
                 }
                 totalNs += ns
+
                 //Memory Use:
                 val heapMb = currentHeapUsedMb()
                 if (heapMb > peakHeapMb) peakHeapMb = heapMb
@@ -183,6 +202,19 @@ class MainActivity : ComponentActivity() {
                 val pss = readProcessPss()
                 sumPssMb += pss.totalPssMb
                 if (pss.totalPssMb > peakPssMb) peakPssMb = pss.totalPssMb
+
+                // Sample battery current (mA)
+                getBatteryCurrentMicroAmps()?.let { microA ->
+                    val ma = abs(microA) / 1000.0   // magnitude; many devices use negative for discharge
+                    sumCurrentMa += ma
+                    currentSamples++
+                }
+
+                // Sample CPU temperature (°C) if available
+                getCpuTemperatureC()?.let { tempC ->
+                    sumCpuTempC += tempC
+                    cpuTempSamples++
+                }
             }
 
             val batteryEnd = getBatteryPercent()
@@ -206,6 +238,36 @@ class MainActivity : ComponentActivity() {
             val avgPssStr = String.format("%.1f MB (avg PSS)", avgPssMb)
             val peakPssStr = String.format("%.1f MB (peak PSS)", peakPssMb)
 
+            // Average current and CPU temp strings
+            var avgMaForEnergy: Double? = null
+            val avgCurrentStr = if (currentSamples > 0) {
+                val avgMa = sumCurrentMa / currentSamples
+                avgMaForEnergy = avgMa
+                String.format("%.1f mA (avg device current)", avgMa)
+            } else {
+                "n/a"
+            }
+
+            val avgCpuTempStr = if (cpuTempSamples > 0) {
+                val avgC = sumCpuTempC / cpuTempSamples
+                String.format("%.1f °C (avg CPU)", avgC)
+            } else {
+                "n/a"
+            }
+
+            // NEW: approximate energy per inference (mJ)
+            val energyPerInfStr = if (avgMaForEnergy != null && batteryVoltageMv != null) {
+                val avgCurrentA = avgMaForEnergy / 1000.0              // mA → A
+                val totalSeconds = totalNs / 1_000_000_000.0           // ns → s
+                val voltageV = batteryVoltageMv / 1000.0               // mV → V
+                val totalEnergyJ = voltageV * avgCurrentA * totalSeconds
+                val perInfJ = totalEnergyJ / rounds
+                val perInfmJ = perInfJ * 1000.0
+                String.format("%.3f mJ / inference (approx)", perInfmJ)
+            } else {
+                "n/a"
+            }
+
             withContext(Dispatchers.Main) {
                 dumpFile = outFile
                 docHv = lastHv
@@ -220,10 +282,14 @@ class MainActivity : ComponentActivity() {
                 avgMsText = "${avgMs.toLong()} ms (avg over $rounds)"
                 totalMsText = "${totalMs.toLong()} ms (total)"
                 batteryText = batteryStr
-                peakHeapText = "${round(peakHeapMb * 10) / 10.0} MB (peak heap)"
+                peakHeapText = "${kotlin.math.round(peakHeapMb * 10) / 10.0} MB (peak heap)"
 
                 avgPssText = avgPssStr
                 peakPssText = peakPssStr
+
+                avgCurrentText = avgCurrentStr
+                avgCpuTempText = avgCpuTempStr
+                energyPerInfText = energyPerInfStr
 
                 isProcessing = false
             }
@@ -232,11 +298,13 @@ class MainActivity : ComponentActivity() {
 
     private fun openApkPicker() {
         if (!isProcessing) {
-            pickApk.launch(arrayOf(
-                "application/vnd.android.package-archive",
-                "application/zip",
-                "*/*"
-            ))
+            pickApk.launch(
+                arrayOf(
+                    "application/vnd.android.package-archive",
+                    "application/zip",
+                    "*/*"
+                )
+            )
         }
     }
 
@@ -285,11 +353,12 @@ class MainActivity : ComponentActivity() {
                                 bestSimText = "--"; class1SimText = "--"; class2SimText = "--"
                                 avgMsText = "--"; totalMsText = "--"; batteryText = "--"; peakHeapText = "--"
                                 avgPssText = "--"; peakPssText = "--"
+                                avgCurrentText = "--"; avgCpuTempText = "--"
+                                energyPerInfText = "--"
                                 predictedEmoji = ""; predictedClassName = ""
                                 dumpFile = null; docHv = null
                             }
                         },
-
 
                         emoji = predictedEmoji,
                         emojiLabel = predictedClassName,
@@ -302,9 +371,14 @@ class MainActivity : ComponentActivity() {
                         totalMs = totalMsText,
                         battery = batteryText,
                         peakHeap = peakHeapText,
-                        // NEW: PSS stats
+                        // PSS stats
                         avgPss = avgPssText,
                         peakPss = peakPssText,
+                        // power + thermal
+                        avgCurrent = avgCurrentText,
+                        avgCpuTemp = avgCpuTempText,
+                        // NEW: energy
+                        energyPerInf = energyPerInfText,
                         onOpenClassicModels = { openClassicModels() }
                     )
                 }
@@ -357,6 +431,66 @@ class MainActivity : ComponentActivity() {
         return if (level >= 0 && scale > 0) ((level / scale.toFloat()) * 100f).roundToInt() else null
     }
 
+    // NEW: get battery voltage (mV) for energy estimate
+    private fun getBatteryVoltageMillivolts(): Int? {
+        val ifilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val status = registerReceiver(null, ifilter) ?: return null
+        val mv = status.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1)
+        return if (mv > 0) mv else null
+    }
+
+    // Get instantaneous battery current in microamps (may be negative for discharge)
+    private fun getBatteryCurrentMicroAmps(): Int? {
+        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+        val cur = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+        return if (cur != Int.MIN_VALUE) cur else null
+    }
+    // Read a CPU-related thermal zone temperature from /sys/class/thermal in °C
+    private fun readCpuThermalZoneTemp(): Double? {
+        val dir = File("/sys/class/thermal")
+        if (!dir.exists() || !dir.isDirectory) return null
+
+        // Common CPU / SoC labels across vendors
+        val cpuTags = listOf(
+            "cpu", "soc", "ap", "a53", "a57", "a73", "a75", "a76", "a77", "a78",
+            "big", "little"
+        )
+
+        dir.listFiles()?.forEach { zone ->
+            val typeFile = File(zone, "type")
+            val tempFile = File(zone, "temp")
+
+            if (typeFile.exists() && tempFile.exists()) {
+                try {
+                    val label = typeFile.readText().trim().lowercase()
+                    if (cpuTags.any { tag -> label.contains(tag) }) {
+                        val raw = tempFile.readText().trim()
+                        val rawVal = raw.toFloat()
+
+                        // Most devices report millidegrees C (e.g., 34567 = 34.567°C)
+                        val tempC = if (rawVal > 200) rawVal / 1000f else rawVal
+                        return tempC.toDouble()
+                    }
+                } catch (e: Exception) {
+                    Log.w("MainActivity", "Error reading thermal zone ${zone.name}: ${e.message}")
+                }
+            }
+        }
+        return null
+    }
+
+
+    // Get current CPU temperature in °C if supported (Android 11+)
+    // Get current CPU temperature in °C using reflection (no direct ThermalManager dependency)
+    // Get current CPU temperature in °C (from /sys/class/thermal), or null if not available
+    private fun getCpuTemperatureC(): Double? {
+        // No SDK dependency; just read Linux thermal zones
+        return readCpuThermalZoneTemp()
+    }
+
+
+
+
     //Memory Heap Measurement
     private fun currentHeapUsedMb(): Double {
         val rt = Runtime.getRuntime()
@@ -369,7 +503,6 @@ class MainActivity : ComponentActivity() {
         val javaHeapMb: Double?,
         val nativeHeapMb: Double?
     )
-
 
     private fun readProcessPss(): ProcMemSnapshot {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -394,12 +527,11 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
+
     private fun openClassicModels() {
         startActivity(Intent(this, ClassicModelsActivity::class.java))
     }
-
 }
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -425,9 +557,13 @@ fun ClassifierScreen(
     totalMs: String,
     battery: String,
     peakHeap: String,
-
     avgPss: String,
     peakPss: String,
+    // power + thermal
+    avgCurrent: String,
+    avgCpuTemp: String,
+    // NEW: energy per inference
+    energyPerInf: String,
     onOpenClassicModels: () -> Unit
 ) {
     val isBusy = isProcessing || isLoadingVectors
@@ -441,7 +577,6 @@ fun ClassifierScreen(
     ) {
         Text("Android Code Classifier", fontSize = 24.sp, fontWeight = FontWeight.Bold)
 
-
         if (emoji.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
             Text(text = "$emoji  $emojiLabel", fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
@@ -449,7 +584,6 @@ fun ClassifierScreen(
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Spacer(Modifier.height(8.dp))
-
 
             var expanded by remember { mutableStateOf(false) }
             ExposedDropdownMenuBox(
@@ -486,7 +620,6 @@ fun ClassifierScreen(
 
             Spacer(Modifier.height(12.dp))
 
-
             OutlinedTextField(
                 value = runsText,
                 onValueChange = { onRunsChange(it) },
@@ -496,7 +629,6 @@ fun ClassifierScreen(
             )
 
             Spacer(Modifier.height(12.dp))
-
 
             Button(
                 onClick = onPickApk,
@@ -527,12 +659,18 @@ fun ClassifierScreen(
             Text(text = "Total time: $totalMs", fontSize = 14.sp)
             Text(text = "Battery: $battery", fontSize = 14.sp)
 
-
             Text(text = "Avg PSS: $avgPss", fontSize = 14.sp)
             Text(text = "Peak PSS: $peakPss", fontSize = 14.sp)
 
-
             Text(text = "Peak heap used: $peakHeap", fontSize = 14.sp)
+
+            // current + thermal info
+            Spacer(Modifier.height(8.dp))
+            Text(text = "Avg current: $avgCurrent", fontSize = 14.sp)
+            Text(text = "CPU temp: $avgCpuTemp", fontSize = 14.sp)
+
+            // NEW: energy per inference
+            Text(text = "Energy per inference: $energyPerInf", fontSize = 14.sp)
 
             if (isBusy) {
                 Spacer(Modifier.height(12.dp))
@@ -555,6 +693,5 @@ fun ClassifierScreen(
                 modifier = Modifier.fillMaxWidth()
             ) { Text("Classic Models") }
         }
-
     }
 }
